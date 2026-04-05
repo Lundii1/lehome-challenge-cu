@@ -2,7 +2,7 @@
 
 Standalone training and evaluation of the Liquid+MDN imitation learning policy on
 LeHome-format (LeRobot v3.0) datasets.  Reuses the model classes from
-`liquid_robomimic/modeling.py` without depending on the RoboMimic framework.
+`liquid_lehome/modeling.py`.
 
 ## Expected Dataset Layout
 
@@ -51,6 +51,16 @@ All observation keys are configurable via the JSON config:
 - `action_dim` must match the dimension of the `action` column in parquet.
 
 ## Training
+
+LeHome datasets store control/state/action streams at `30 Hz`, while the garment
+simulator steps at `90 Hz`. The `liquid_lehome` config now treats `control_hz`
+and `deployment_env_hz` as explicit settings:
+
+- Training validates that `meta/info.json` matches `control_hz`
+- The custom LeHome policy adapter holds each predicted action for
+  `deployment_env_hz / control_hz` simulator steps during `scripts.eval`
+- With the default LeHome settings, this means `30 Hz` control on a `90 Hz`
+  simulator loop, i.e. `3` simulator steps per policy action
 
 ```bash
 cd /path/to/liquidnets
@@ -108,6 +118,40 @@ the configured RGB cameras into a single video, and prints mean action MSE again
 the recorded actions for that episode. Use `--max_steps` to limit clip length and
 `--video_fps` to override the dataset FPS.
 
+## Fast Diagnostics
+
+Use the diagnostics entrypoint before committing to a long retrain. It can run
+cheap offline checks on a checkpoint and/or a short training smoke on a handful
+of episodes.
+
+```bash
+# Check whether a checkpoint reacts more to RGB swaps than to state swaps
+python -m liquid_lehome --mode diagnose \
+    --checkpoint outputs/liquid_lehome/best.pt \
+    --dataset_root /path/to/dataset \
+    --device cpu
+
+# Run a 100-step training smoke on 4 episodes, then run the same sensitivity checks
+python -m liquid_lehome --mode diagnose \
+    --config configs/lehome/liquid_mdn_lehome.json \
+    --dataset_root /path/to/dataset \
+    --device cpu \
+    --train_smoke_steps 100 \
+    --train_smoke_episodes 4
+```
+
+The checkpoint sensitivity suite reports:
+
+- `zero_rgb_delta`: how much predictions change when RGB is zeroed
+- `rgb_swap_delta`: how much predictions change when RGB comes from another episode
+- `state_swap_delta`: how much predictions change when state comes from another episode
+- `rgb_state_ratio`: `rgb_swap_delta / state_swap_delta`; very small values usually mean RGB is being ignored
+- `pairwise_chunk_delta`: how different the first predicted action chunks are across different dataset windows
+
+The train smoke additionally reports gradient norms for coarse parameter groups
+(`rgb`, `state`, `temporal`, `other`) so you can catch cases where the visual
+path receives almost no learning signal.
+
 ### Using the policy in LeHome evaluation
 
 ```python
@@ -117,6 +161,7 @@ policy = LiquidLeHomePolicy(
     checkpoint_path="outputs/liquid_lehome/best.pt",
     dataset_root="/path/to/dataset",  # for normalization stats
     device="cuda",
+    env_step_hz=90,  # hold each control action for 3 sim steps by default
 )
 policy.reset()
 
@@ -138,7 +183,7 @@ python -m unittest tests.test_liquid_lehome -v
   training, and denormalized back at inference.
 - Images are resized to 96x96 (configurable via `rgb_image_size`).
 - Video frames are decoded with `imageio`; parquet data via `pandas + pyarrow`.
-- The model architecture (Liquid CfC + MDN head + shared backbone) is imported
-  unchanged from `liquid_robomimic/modeling.py`.
+- The model architecture (Liquid/GRU observation core + MDN head + shared
+  backbone) is implemented directly in `liquid_lehome/modeling.py`.
 - Teacher forcing schedule: ratio 1.0 → 0.15, free-running weight 0.2 → 0.75
   over the course of training (same as the original RoboMimic experiments).

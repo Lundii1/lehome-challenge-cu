@@ -13,12 +13,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from liquid_robomimic.modeling import LiquidMDNPolicy, SharedObsBackbone
-
-from .config import LeHomeConfig, config_to_backbone, config_to_policy, load_config
+from .config import (
+    LeHomeConfig,
+    compute_env_steps_per_policy_step,
+    load_config,
+)
 from .dataset import LeHomeSequenceDataset
+from .modeling import LiquidMDNPolicy
 from .normalize import NormalizationStats, load_stats, min_max_denormalize, min_max_normalize
-from .train import _build_obs_shapes
+from .train import _build_model_for_state_dict
 
 
 class LiquidLeHomePolicy:
@@ -41,6 +44,8 @@ class LiquidLeHomePolicy:
         device: str = "cuda",
         config_path: Optional[str] = None,
         dataset_root: Optional[str] = None,
+        env_step_hz: Optional[int] = None,
+        control_hz: Optional[int] = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
@@ -51,11 +56,17 @@ class LiquidLeHomePolicy:
         else:
             cfg = LeHomeConfig(**ckpt["config"])
         self.cfg = cfg
+        self.control_hz = int(control_hz or cfg.control_hz)
+        self.env_step_hz = int(env_step_hz) if env_step_hz is not None else None
+        self.env_steps_per_policy_step = (
+            compute_env_steps_per_policy_step(self.control_hz, self.env_step_hz)
+            if self.env_step_hz is not None
+            else 1
+        )
 
-        # Build model
-        obs_shapes = _build_obs_shapes(cfg)
-        backbone = SharedObsBackbone(obs_shapes, config_to_backbone(cfg))
-        self.policy = LiquidMDNPolicy(backbone, config_to_policy(cfg))
+        # Build model. Older checkpoints use the legacy mean-fusion backbone,
+        # while newer ones include ``backbone.fusion_proj`` from the enhanced backbone.
+        self.policy = _build_model_for_state_dict(cfg, ckpt["model_state_dict"])
         self.policy.load_state_dict(ckpt["model_state_dict"])
         self.policy.to(self.device)
         self.policy.eval()
@@ -73,6 +84,9 @@ class LiquidLeHomePolicy:
         # Internal queues (mirrors algo.py lines 210-241)
         self.obs_queue: Optional[Dict[str, deque]] = None
         self.action_queue: deque = deque()
+        self.held_action: Optional[torch.Tensor] = None
+        self.env_steps_until_next_policy_step = 0
+        self._last_debug_snapshot: Optional[Dict[str, object]] = None
         self.reset()
 
     def reset(self) -> None:
@@ -82,6 +96,30 @@ class LiquidLeHomePolicy:
         for key in list(self.cfg.rgb_keys) + list(self.cfg.low_dim_keys):
             self.obs_queue[key] = deque(maxlen=obs_horizon)
         self.action_queue = deque(maxlen=self.cfg.action_horizon)
+        self.held_action = None
+        self.env_steps_until_next_policy_step = 0
+        self._last_debug_snapshot = None
+
+    def get_debug_snapshot(self) -> Optional[Dict[str, object]]:
+        """Return structured debug information for the last selected action."""
+        if self._last_debug_snapshot is None:
+            return None
+
+        snapshot: Dict[str, object] = {}
+        for key, value in self._last_debug_snapshot.items():
+            if isinstance(value, np.ndarray):
+                snapshot[key] = value.copy()
+            elif isinstance(value, list):
+                copied = []
+                for item in value:
+                    if isinstance(item, np.ndarray):
+                        copied.append(item.copy())
+                    else:
+                        copied.append(item)
+                snapshot[key] = copied
+            else:
+                snapshot[key] = value
+        return snapshot
 
     def select_action(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
         """Return a single action from the receding-horizon queue.
@@ -98,11 +136,32 @@ class LiquidLeHomePolicy:
             Action of shape ``(action_dim,)`` in the original (un-normalized)
             joint-position space.
         """
+        current_state = observation.get("observation.state")
+        current_state_np = (
+            np.asarray(current_state, dtype=np.float32).copy()
+            if current_state is not None
+            else None
+        )
+
+        if self.env_steps_until_next_policy_step > 0 and self.held_action is not None:
+            self.env_steps_until_next_policy_step -= 1
+            held_action_np = self.held_action.detach().cpu().numpy().copy()
+            self._last_debug_snapshot = self._make_debug_snapshot(
+                state=current_state_np,
+                action=held_action_np,
+                action_origin="held",
+                fresh_rollout_generated=False,
+                rollout_preview=None,
+            )
+            return held_action_np
+
         # Pre-process and append to queues
         processed = self._preprocess(observation)
         self._append_obs(processed)
 
         # Predict new trajectory when action queue is exhausted
+        rollout_preview: Optional[list[np.ndarray]] = None
+        fresh_rollout_generated = False
         if len(self.action_queue) == 0:
             stacked_obs = self._stack_obs_queue()
             with torch.inference_mode():
@@ -116,8 +175,25 @@ class LiquidLeHomePolicy:
             if self.action_stats is not None and self.cfg.normalize_actions:
                 actions = min_max_denormalize(actions, self.action_stats)
             self.action_queue.extend(actions)
+            rollout_preview = [
+                actions[i].detach().cpu().numpy().copy()
+                for i in range(min(3, actions.shape[0]))
+            ]
+            fresh_rollout_generated = True
 
-        return self.action_queue.popleft().cpu().numpy()
+        action = self.action_queue.popleft()
+        if self.env_steps_per_policy_step > 1:
+            self.held_action = action.detach().clone()
+            self.env_steps_until_next_policy_step = self.env_steps_per_policy_step - 1
+        action_np = action.detach().cpu().numpy().copy()
+        self._last_debug_snapshot = self._make_debug_snapshot(
+            state=current_state_np,
+            action=action_np,
+            action_origin="new",
+            fresh_rollout_generated=fresh_rollout_generated,
+            rollout_preview=rollout_preview,
+        )
+        return action_np
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -176,6 +252,33 @@ class LiquidLeHomePolicy:
         for key, q in self.obs_queue.items():
             stacked[key] = torch.stack(list(q), dim=0).unsqueeze(0)  # (1, T, ...)
         return stacked
+
+    def _make_debug_snapshot(
+        self,
+        state: Optional[np.ndarray],
+        action: np.ndarray,
+        action_origin: str,
+        fresh_rollout_generated: bool,
+        rollout_preview: Optional[list[np.ndarray]],
+    ) -> Dict[str, object]:
+        action_minus_state = None
+        if state is not None and state.shape == action.shape:
+            action_minus_state = action - state
+
+        return {
+            "state": state.copy() if state is not None else None,
+            "action": action.copy(),
+            "action_minus_state": action_minus_state.copy() if action_minus_state is not None else None,
+            "action_origin": action_origin,
+            "fresh_rollout_generated": fresh_rollout_generated,
+            "remaining_hold_count": int(self.env_steps_until_next_policy_step),
+            "action_queue_len": int(len(self.action_queue)),
+            "rollout_preview": rollout_preview,
+            "sample_selection_mode": self.cfg.sample_selection_mode,
+            "control_hz": int(self.control_hz),
+            "env_step_hz": int(self.env_step_hz or self.control_hz),
+            "env_steps_per_policy_step": int(self.env_steps_per_policy_step),
+        }
 
 
 def _ensure_uint8_image(frame: np.ndarray) -> np.ndarray:
@@ -306,6 +409,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", type=str, default=None, help="Path to JSON config (optional)")
     p.add_argument("--dataset_root", type=str, default=None, help="Dataset root for stats")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--env_step_hz",
+        type=int,
+        default=None,
+        help="Optional simulator step rate. When set, actions are held across simulator steps to match control_hz.",
+    )
     p.add_argument("--video_path", type=str, default=None, help="Optional path for offline episode video export")
     p.add_argument("--episode_index", type=int, default=0, help="Dataset episode index to export when --video_path is set")
     p.add_argument("--max_steps", type=int, default=None, help="Optional limit on exported episode steps")
@@ -320,10 +429,15 @@ def main() -> None:
         device=args.device,
         config_path=args.config,
         dataset_root=args.dataset_root,
+        env_step_hz=args.env_step_hz,
     )
     print(f"Loaded policy from {args.checkpoint}")
     print(f"  action_dim={policy.cfg.action_dim}, obs_horizon={policy.cfg.observation_horizon}")
     print(f"  action_horizon={policy.cfg.action_horizon}, pred_horizon={policy.cfg.prediction_horizon}")
+    print(
+        f"  control_hz={policy.control_hz}, env_step_hz={policy.env_step_hz or policy.control_hz}, "
+        f"env_steps_per_policy_step={policy.env_steps_per_policy_step}"
+    )
 
     if args.video_path is not None:
         dataset_root = args.dataset_root or policy.cfg.dataset_root

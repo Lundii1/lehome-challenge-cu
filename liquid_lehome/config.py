@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
-from liquid_robomimic.modeling import LiquidPolicyConfig, SharedBackboneConfig
+from .modeling import LiquidPolicyConfig, SharedBackboneConfig
 
 
 @dataclass(frozen=True)
@@ -26,13 +26,13 @@ class LeHomeConfig:
 
     # -- Image preprocessing --
     rgb_image_size: int = 96
-    rgb_encoder_kind: str = "tiny_cnn"
-    freeze_rgb_encoder: bool = False
+    rgb_encoder_kind: str = "clip"
+    freeze_rgb_encoder: bool = True
     clip_model_name: str = "openai/clip-vit-base-patch32"
 
     # -- Backbone dims --
-    model_dim: int = 256
-    temporal_num_layers: int = 4
+    model_dim: int = 512
+    temporal_num_layers: int = 5
     temporal_num_heads: int = 8
     temporal_mlp_ratio: int = 4
     dropout: float = 0.1
@@ -42,26 +42,29 @@ class LeHomeConfig:
     observation_horizon: int = 2
     action_horizon: int = 8
     prediction_horizon: int = 16
+    control_hz: int = 30
+    deployment_env_hz: int = 90
 
     # -- MDN / Liquid --
     num_mixtures: int = 5
-    liquid_hidden_dim: int = 291
-    decoder_hidden_dim: int = 291
-    action_embed_dim: int = 256
+    liquid_hidden_dim: int = 960
+    decoder_hidden_dim: int = 960
+    action_embed_dim: int = 512
     use_cfc: bool = True
 
     # -- Inference --
-    sample_selection_mode: str = "mean"
+    sample_selection_mode: str = "best_of_k"
     sample_selection_k: int = 10
 
     # -- Training --
-    batch_size: int = 32
+    batch_size: int = 64
     num_epochs: int = 120
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
     max_grad_norm: float = 1.0
-    warmup_steps: int = 500
-    num_data_workers: int = 2
+    warmup_epochs: int = 3
+    warmup_steps: Optional[int] = None
+    num_data_workers: int = 4
 
     # -- Teacher forcing schedule --
     teacher_forcing_start: float = 1.0
@@ -73,6 +76,10 @@ class LeHomeConfig:
     normalize_actions: bool = True
     normalize_state: bool = True
 
+    # -- Visual learning --
+    state_dropout_p: float = 0.15
+    enable_image_augmentation: bool = True
+
     # -- Output --
     output_dir: str = "outputs/liquid_lehome"
     save_every_n_epochs: int = 25
@@ -80,6 +87,23 @@ class LeHomeConfig:
     val_split_ratio: float = 0.1
     seed: int = 42
     device: str = "cuda"
+
+
+def compute_env_steps_per_policy_step(control_hz: int, env_step_hz: int) -> int:
+    """Return how many simulator steps should reuse one policy action."""
+    if control_hz <= 0 or env_step_hz <= 0:
+        raise ValueError(
+            f"control_hz and env_step_hz must be positive, got {control_hz} and {env_step_hz}"
+        )
+
+    ratio = float(env_step_hz) / float(control_hz)
+    repeat = int(round(ratio))
+    if repeat < 1 or abs(ratio - repeat) > 1e-6:
+        raise ValueError(
+            "LeHome control alignment requires env_step_hz to be an integer multiple "
+            f"of control_hz, got control_hz={control_hz}, env_step_hz={env_step_hz}"
+        )
+    return repeat
 
 
 def load_config(path: str) -> LeHomeConfig:

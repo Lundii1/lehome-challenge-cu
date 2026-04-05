@@ -9,6 +9,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+# Bootstrap pip-installed Isaac Sim before importing Isaac Lab/Omniverse modules.
+import isaacsim
 from isaacsim.simulation_app import SimulationApp
 from isaaclab.envs import DirectRLEnv
 from isaaclab_tasks.utils import parse_env_cfg

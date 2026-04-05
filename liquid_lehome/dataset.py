@@ -54,6 +54,7 @@ class LeHomeSequenceDataset(Dataset):
         state_normalize_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         action_normalize_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         episode_indices: Optional[List[int]] = None,
+        enable_image_augmentation: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -65,6 +66,7 @@ class LeHomeSequenceDataset(Dataset):
         self.rgb_image_size = rgb_image_size
         self.state_normalize_fn = state_normalize_fn
         self.action_normalize_fn = action_normalize_fn
+        self.enable_image_augmentation = enable_image_augmentation
 
         # Load metadata
         with open(self.root / "meta" / "info.json", encoding="utf-8") as f:
@@ -230,6 +232,8 @@ class LeHomeSequenceDataset(Dataset):
         # Parquet data: state and actions
         global_start = ep.data_start + offset
         rows = self._df.iloc[global_start : global_start + total_len]
+        low_dim_columns = {key: rows[key] for key in self.low_dim_keys if key in rows}
+        action_column = rows["action"]
 
         # Build obs_dict (first obs_horizon frames)
         obs_dict: Dict[str, torch.Tensor] = {}
@@ -254,17 +258,17 @@ class LeHomeSequenceDataset(Dataset):
         for key in self.low_dim_keys:
             parts = []
             for t in range(self.obs_horizon):
-                val = rows.iloc[t][key]
+                val = low_dim_columns[key].iloc[t]
                 parts.append(self._to_float_tensor(val))
             stacked = torch.stack(parts, dim=0)
             if self.state_normalize_fn is not None:
                 stacked = self.state_normalize_fn(stacked)
             obs_dict[key] = stacked
 
-        # Action target (pred_horizon frames)
+        # Action target (pred_horizon frames, starting after observation window)
         actions = []
         for t in range(self.pred_horizon):
-            act = rows.iloc[t]["action"]
+            act = action_column.iloc[self.obs_horizon + t]
             actions.append(self._to_float_tensor(act))
         action_tensor = torch.stack(actions, dim=0)
         if self.action_normalize_fn is not None:
@@ -293,6 +297,8 @@ class LeHomeSequenceDataset(Dataset):
 
     def _to_image_tensor(self, img: np.ndarray) -> torch.Tensor:
         """Convert a (H, W, 3) uint8 image to (3, H', W') float [0,1]."""
+        if self.enable_image_augmentation:
+            img = self._augment_image(img)
         t = torch.from_numpy(img).float() / 255.0
         t = t.permute(2, 0, 1)
         t = F.interpolate(
@@ -302,6 +308,27 @@ class LeHomeSequenceDataset(Dataset):
             align_corners=False,
         ).squeeze(0)
         return t
+
+    @staticmethod
+    def _augment_image(img: np.ndarray) -> np.ndarray:
+        """Apply random color jitter and crop to a (H, W, 3) uint8 image."""
+        # Random brightness/contrast jitter
+        if np.random.rand() < 0.5:
+            img = img.astype(np.float32)
+            brightness = np.random.uniform(0.8, 1.2)
+            img = img * brightness
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+        # Random crop (keep 80-100% of the image)
+        if np.random.rand() < 0.5:
+            h, w = img.shape[:2]
+            scale = np.random.uniform(0.80, 1.0)
+            crop_h, crop_w = int(h * scale), int(w * scale)
+            y = np.random.randint(0, h - crop_h + 1)
+            x = np.random.randint(0, w - crop_w + 1)
+            img = img[y : y + crop_h, x : x + crop_w]
+
+        return img
 
     @staticmethod
     def _to_float_tensor(val) -> torch.Tensor:

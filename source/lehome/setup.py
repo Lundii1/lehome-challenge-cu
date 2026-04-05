@@ -19,8 +19,10 @@ EXTENSION_TOML_DATA = toml.load(
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    # NOTE: Add dependencies
     "psutil",
+    "omegaconf",
+    "plotly",
+    "open3d>=0.19.0",
 ]
 
 # Installation operation

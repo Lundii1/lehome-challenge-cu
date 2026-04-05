@@ -26,6 +26,10 @@ class BasePolicy(abc.ABC):
         """
         pass
 
+    def get_debug_snapshot(self) -> Dict[str, Any] | None:
+        """Return optional structured debug information for the last policy step."""
+        return None
+
     @abc.abstractmethod
     def select_action(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
         """

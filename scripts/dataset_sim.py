@@ -13,6 +13,8 @@ if multiprocessing.get_start_method() != "spawn":
 
 import argparse
 
+# Bootstrap pip-installed Isaac Sim before importing Isaac Lab/Omniverse modules.
+import isaacsim
 from isaaclab.app import AppLauncher
 
 from .utils import common, setup_record_parser, setup_replay_parser

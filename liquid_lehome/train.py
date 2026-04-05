@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import time
@@ -14,14 +15,17 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 
-from liquid_robomimic.modeling import (
-    LiquidMDNPolicy,
-    SharedObsBackbone,
-    mdn_nll_loss,
-)
+from .backbone_override import EnhancedObsBackbone
 
-from .config import LeHomeConfig, config_to_backbone, config_to_policy, load_config
+from .config import (
+    LeHomeConfig,
+    compute_env_steps_per_policy_step,
+    config_to_backbone,
+    config_to_policy,
+    load_config,
+)
 from .dataset import LeHomeSequenceDataset
+from .modeling import LiquidMDNPolicy, SharedObsBackbone, mdn_nll_loss
 from .normalize import NormalizationStats, load_stats, min_max_normalize
 
 
@@ -46,16 +50,45 @@ def _build_obs_shapes(cfg: LeHomeConfig) -> Dict[str, tuple]:
 
 
 def _build_model(cfg: LeHomeConfig) -> LiquidMDNPolicy:
+    return _build_model_for_state_dict(cfg)
+
+
+def _state_dict_uses_enhanced_backbone(state_dict: Optional[Dict[str, torch.Tensor]]) -> bool:
+    if not state_dict:
+        return True
+    return any(key.startswith("backbone.fusion_proj.") for key in state_dict)
+
+
+def _build_model_for_state_dict(
+    cfg: LeHomeConfig,
+    state_dict: Optional[Dict[str, torch.Tensor]] = None,
+) -> LiquidMDNPolicy:
     obs_shapes = _build_obs_shapes(cfg)
-    backbone = SharedObsBackbone(obs_shapes, config_to_backbone(cfg))
+    backbone_cfg = config_to_backbone(cfg)
+    if _state_dict_uses_enhanced_backbone(state_dict):
+        backbone = EnhancedObsBackbone(
+            obs_shapes,
+            backbone_cfg,
+            state_dropout_p=cfg.state_dropout_p,
+        )
+    else:
+        backbone = SharedObsBackbone(obs_shapes, backbone_cfg)
     return LiquidMDNPolicy(backbone, config_to_policy(cfg))
 
 
-def _get_cosine_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float) -> float:
+def _load_dataset_fps(dataset_root: str) -> int:
+    info_path = Path(dataset_root) / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    return int(info["fps"])
+
+
+def _get_cosine_lr(
+    step: int, warmup_steps: int, total_steps: int, base_lr: float, eta_min: float = 3e-7
+) -> float:
     if step < warmup_steps:
         return base_lr * step / max(1, warmup_steps)
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return eta_min + (base_lr - eta_min) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def _schedule(epoch: int, num_epochs: int, cfg: LeHomeConfig):
@@ -126,6 +159,16 @@ def train(cfg: LeHomeConfig) -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_fps = _load_dataset_fps(cfg.dataset_root)
+    if dataset_fps != cfg.control_hz:
+        raise ValueError(
+            "LeHome Liquid training expects control_hz to match the dataset frame rate. "
+            f"Dataset fps={dataset_fps}, config control_hz={cfg.control_hz}."
+        )
+    env_steps_per_policy_step = compute_env_steps_per_policy_step(
+        cfg.control_hz,
+        cfg.deployment_env_hz,
+    )
 
     # -- Normalization stats --
     norm_stats = load_stats(cfg.dataset_root)
@@ -134,7 +177,6 @@ def train(cfg: LeHomeConfig) -> None:
 
     # -- Datasets --
     # Split episodes: last val_split_ratio fraction for validation
-    import json
     info_path = Path(cfg.dataset_root) / "meta" / "info.json"
     info = json.loads(info_path.read_text(encoding="utf-8"))
     total_episodes = int(info["total_episodes"])
@@ -153,8 +195,16 @@ def train(cfg: LeHomeConfig) -> None:
         state_normalize_fn=_make_normalize_fn(state_stats),
         action_normalize_fn=_make_normalize_fn(action_stats),
     )
-    train_ds = LeHomeSequenceDataset(episode_indices=train_episodes, **common_kwargs)
-    val_ds = LeHomeSequenceDataset(episode_indices=val_episodes, **common_kwargs)
+    train_ds = LeHomeSequenceDataset(
+        episode_indices=train_episodes,
+        enable_image_augmentation=cfg.enable_image_augmentation,
+        **common_kwargs,
+    )
+    val_ds = LeHomeSequenceDataset(
+        episode_indices=val_episodes,
+        enable_image_augmentation=False,
+        **common_kwargs,
+    )
     train_batch_sampler = EpisodeOrderedBatchSampler(
         episode_window_ranges=train_ds.episode_window_ranges,
         batch_size=cfg.batch_size,
@@ -183,6 +233,17 @@ def train(cfg: LeHomeConfig) -> None:
 
         print(f"Train windows: {len(train_ds)}, Val windows: {len(val_ds)}")
         print(f"Train episodes: {len(train_episodes)}, Val episodes: {len(val_episodes)}")
+        print(
+            "Control alignment: "
+            f"dataset/control_hz={dataset_fps}Hz, deployment_env_hz={cfg.deployment_env_hz}Hz, "
+            f"env_steps_per_policy_step={env_steps_per_policy_step}"
+        )
+        print(
+            "Effective horizons: "
+            f"obs={cfg.observation_horizon / cfg.control_hz:.3f}s, "
+            f"action={cfg.action_horizon / cfg.control_hz:.3f}s, "
+            f"prediction={cfg.prediction_horizon / cfg.control_hz:.3f}s"
+        )
 
         # -- Model --
         policy = _build_model(cfg).to(device)
@@ -194,7 +255,9 @@ def train(cfg: LeHomeConfig) -> None:
             policy.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
         )
 
-        total_steps = cfg.num_epochs * len(train_loader)
+        steps_per_epoch = len(train_loader)
+        total_steps = cfg.num_epochs * steps_per_epoch
+        warmup_steps = cfg.warmup_epochs * steps_per_epoch
         global_step = 0
         best_val_loss = float("inf")
 
@@ -232,7 +295,7 @@ def train(cfg: LeHomeConfig) -> None:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
 
                 # Cosine LR
-                lr = _get_cosine_lr(global_step, cfg.warmup_steps, total_steps, cfg.learning_rate)
+                lr = _get_cosine_lr(global_step, warmup_steps, total_steps, cfg.learning_rate)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
                 optimizer.step()

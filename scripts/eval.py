@@ -3,6 +3,8 @@ import multiprocessing
 if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 
+# Bootstrap pip-installed Isaac Sim before importing Isaac Lab/Omniverse modules.
+import isaacsim
 from isaaclab.app import AppLauncher
 
 from .utils import common

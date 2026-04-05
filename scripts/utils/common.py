@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+# Bootstrap pip-installed Isaac Sim before importing Isaac Lab/Omniverse modules.
+import isaacsim
 from isaaclab.app import AppLauncher
 from isaacsim.simulation_app import SimulationApp
 
@@ -71,6 +73,16 @@ def launch_app_from_args(args: argparse.Namespace) -> SimulationApp:
     Returns:
         SimulationApp instance.
     """
+    task_name = getattr(args, "task", "")
+    if (
+        task_name.startswith("LeHome-")
+        and "Garment" in task_name
+        and not getattr(args, "enable_cameras", False)
+    ):
+        # LeHome garment tasks always instantiate camera sensors, so Isaac Sim must
+        # boot with the rendering stack even for headless evaluation on Windows.
+        args.enable_cameras = True
+
     args.kit_args = (
         "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
     )
