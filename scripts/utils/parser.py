@@ -476,6 +476,15 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         default="Assets/robots/so101_new_calib.urdf",
         help="URDF path for IK solver (required when --use_ee_pose is set).",
     )
+    parser.add_argument(
+        "--rollout_mode",
+        type=str,
+        default=None,
+        choices=["mean", "sample", "best_of_k"],
+        help="Override rollout mode at eval time without retraining. "
+             "mean=deterministic weighted mean, sample=stochastic, "
+             "best_of_k=highest model log-prob (may favor conservative trajectories).",
+    )
 
     # Docker policy arguments
     parser.add_argument(

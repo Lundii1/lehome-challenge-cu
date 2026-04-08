@@ -93,7 +93,7 @@ class LiquidLeHomePolicy:
         """Clear observation and action queues."""
         obs_horizon = self.cfg.observation_horizon
         self.obs_queue = {}
-        for key in list(self.cfg.rgb_keys) + list(self.cfg.low_dim_keys):
+        for key in list(self.cfg.rgb_keys) + list(self.cfg.depth_keys) + list(self.cfg.low_dim_keys):
             self.obs_queue[key] = deque(maxlen=obs_horizon)
         self.action_queue = deque(maxlen=self.cfg.action_horizon)
         self.held_action = None
@@ -214,6 +214,25 @@ class LiquidLeHomePolicy:
             t = F.interpolate(
                 t.unsqueeze(0),
                 size=(self.cfg.rgb_image_size, self.cfg.rgb_image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            result[key] = t.to(self.device)
+
+        for key in self.cfg.depth_keys:
+            if key not in observation:
+                continue
+            depth = observation[key]
+            t = torch.from_numpy(np.asarray(depth)).float()
+            # Convert uint16 mm to float meters, then normalize to [0, 1]
+            if t.max() > 100.0:  # likely uint16 in mm
+                t = t / 1000.0  # mm -> meters
+            t = torch.clamp(t / 2.0, 0.0, 1.0)  # normalize to [0,1] assuming max 2m depth
+            if t.ndim == 2:
+                t = t.unsqueeze(0)  # (H, W) -> (1, H, W)
+            t = F.interpolate(
+                t.unsqueeze(0),
+                size=(self.cfg.depth_image_size, self.cfg.depth_image_size),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)

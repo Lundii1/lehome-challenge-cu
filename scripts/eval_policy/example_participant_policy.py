@@ -25,6 +25,7 @@ class CustomPolicy(BasePolicy):
         model_path: Optional[str] = None,
         device: str = "cuda",
         dataset_root: Optional[str] = None,
+        rollout_mode: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -38,11 +39,18 @@ class CustomPolicy(BasePolicy):
             dataset_root=dataset_root,
             env_step_hz=90,
         )
+        # Allow eval-time override of rollout mode without retraining
+        if rollout_mode is not None:
+            self._policy.cfg = type(self._policy.cfg)(
+                **{**self._policy.cfg.__dict__, "sample_selection_mode": rollout_mode}
+            )
+            print(f"[CustomPolicy] Overriding rollout mode to: {rollout_mode}")
         print(
             f"[CustomPolicy] Loaded Liquid+MDN policy from {model_path} "
             f"(device={self._policy.device}, action_dim={self._policy.cfg.action_dim}, "
             f"control_hz={self._policy.control_hz}, env_step_hz={self._policy.env_step_hz}, "
-            f"env_steps_per_policy_step={self._policy.env_steps_per_policy_step})"
+            f"env_steps_per_policy_step={self._policy.env_steps_per_policy_step}, "
+            f"rollout_mode={self._policy.cfg.sample_selection_mode})"
         )
 
     def reset(self):

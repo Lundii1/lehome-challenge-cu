@@ -25,3 +25,8 @@ recordings/
 _isaac_sim?
 # Docker history
 docker/.isaac-lab-docker-history
+# ignore large data/asset dirs (mount at runtime instead)
+Datasets/
+Assets/
+# ignore local venv (rebuilt inside the image)
+.venv/

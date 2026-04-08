@@ -22,10 +22,12 @@ class LeHomeConfig:
         "observation.images.left_rgb",
         "observation.images.right_rgb",
     )
+    depth_keys: Tuple[str, ...] = ()
     low_dim_keys: Tuple[str, ...] = ("observation.state",)
 
     # -- Image preprocessing --
     rgb_image_size: int = 96
+    depth_image_size: int = 96
     rgb_encoder_kind: str = "clip"
     freeze_rgb_encoder: bool = True
     clip_model_name: str = "openai/clip-vit-base-patch32"
@@ -53,7 +55,10 @@ class LeHomeConfig:
     use_cfc: bool = True
 
     # -- Inference --
-    sample_selection_mode: str = "best_of_k"
+    # "sample" avoids the conservative bias of best_of_k, which selects
+    # the trajectory the model is most confident about rather than the
+    # one most likely to succeed at the task.
+    sample_selection_mode: str = "sample"
     sample_selection_k: int = 10
 
     # -- Training --
@@ -68,7 +73,7 @@ class LeHomeConfig:
 
     # -- Teacher forcing schedule --
     teacher_forcing_start: float = 1.0
-    teacher_forcing_end: float = 0.15
+    teacher_forcing_end: float = 0.40
     free_running_weight_start: float = 0.20
     free_running_weight_end: float = 0.75
 
@@ -110,7 +115,7 @@ def load_config(path: str) -> LeHomeConfig:
     """Load a LeHomeConfig from a JSON file."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     # Convert list fields to tuples
-    for key in ("rgb_keys", "low_dim_keys"):
+    for key in ("rgb_keys", "depth_keys", "low_dim_keys"):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
     return LeHomeConfig(**raw)
@@ -130,6 +135,8 @@ def config_to_backbone(cfg: LeHomeConfig) -> SharedBackboneConfig:
         freeze_rgb_encoder=cfg.freeze_rgb_encoder,
         clip_model_name=cfg.clip_model_name,
         rgb_image_size=cfg.rgb_image_size,
+        depth_keys=cfg.depth_keys,
+        depth_image_size=cfg.depth_image_size,
     )
 
 

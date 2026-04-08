@@ -41,6 +41,8 @@ def _build_obs_shapes(cfg: LeHomeConfig) -> Dict[str, tuple]:
     shapes: Dict[str, tuple] = {}
     for key in cfg.rgb_keys:
         shapes[key] = (3, cfg.rgb_image_size, cfg.rgb_image_size)
+    for key in cfg.depth_keys:
+        shapes[key] = (1, cfg.depth_image_size, cfg.depth_image_size)
     for key in cfg.low_dim_keys:
         if key == "observation.state":
             shapes[key] = (cfg.action_dim,)  # state dim == action dim for LeHome
@@ -190,8 +192,10 @@ def train(cfg: LeHomeConfig) -> None:
         obs_horizon=cfg.observation_horizon,
         pred_horizon=cfg.prediction_horizon,
         rgb_keys=cfg.rgb_keys,
+        depth_keys=cfg.depth_keys,
         low_dim_keys=cfg.low_dim_keys,
         rgb_image_size=cfg.rgb_image_size,
+        depth_image_size=cfg.depth_image_size,
         state_normalize_fn=_make_normalize_fn(state_stats),
         action_normalize_fn=_make_normalize_fn(action_stats),
     )
@@ -251,8 +255,27 @@ def train(cfg: LeHomeConfig) -> None:
         print(f"Model parameters: {num_params:,}")
 
         # -- Optimizer --
+        # Use a lower learning rate for pretrained visual encoder parameters
+        # to avoid catastrophic forgetting during fine-tuning.
+        visual_encoder_params = []
+        other_params = []
+        for name, param in policy.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "visual_encoder.encoder" in name:
+                visual_encoder_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups = [{"params": other_params, "lr": cfg.learning_rate, "_lr_ratio": 1.0}]
+        if visual_encoder_params:
+            encoder_lr_ratio = 0.1  # 10x lower LR for pretrained encoder
+            encoder_lr = cfg.learning_rate * encoder_lr_ratio
+            param_groups.append({"params": visual_encoder_params, "lr": encoder_lr, "_lr_ratio": encoder_lr_ratio})
+            print(f"Visual encoder fine-tuning: {len(visual_encoder_params)} param tensors at lr={encoder_lr:.2e}")
+
         optimizer = torch.optim.AdamW(
-            policy.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+            param_groups, lr=cfg.learning_rate, weight_decay=cfg.weight_decay
         )
 
         steps_per_epoch = len(train_loader)
@@ -276,8 +299,15 @@ def train(cfg: LeHomeConfig) -> None:
                 obs_dict = {k: v.to(device) for k, v in obs_dict.items()}
                 actions = actions.to(device)
 
-                # Teacher-forced pass
-                teacher_out = policy(obs_dict, action_target=actions, teacher_forcing_ratio=tf_ratio)
+                # Teacher-forced pass (with scheduled sampling noise)
+                # As teacher forcing decreases, inject increasing noise into
+                # the ground-truth actions so the decoder learns to recover
+                # from small prediction errors before full free-running.
+                noisy_actions = actions
+                if tf_ratio < 1.0:
+                    noise_scale = 0.02 * (1.0 - tf_ratio)
+                    noisy_actions = actions + noise_scale * torch.randn_like(actions)
+                teacher_out = policy(obs_dict, action_target=noisy_actions, teacher_forcing_ratio=tf_ratio)
                 teacher_loss = mdn_nll_loss(
                     teacher_out["logits"], teacher_out["mu"], teacher_out["log_sigma"], actions
                 )
@@ -294,10 +324,11 @@ def train(cfg: LeHomeConfig) -> None:
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
 
-                # Cosine LR
+                # Cosine LR (scale each param group by its initial ratio)
                 lr = _get_cosine_lr(global_step, warmup_steps, total_steps, cfg.learning_rate)
                 for pg in optimizer.param_groups:
-                    pg["lr"] = lr
+                    base_ratio = pg.get("_lr_ratio", 1.0)
+                    pg["lr"] = lr * base_ratio
                 optimizer.step()
 
                 epoch_loss += total_loss.item()

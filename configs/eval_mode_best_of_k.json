@@ -1,0 +1,4 @@
+{
+    "sample_selection_mode": "best_of_k",
+    "sample_selection_k": 10
+}

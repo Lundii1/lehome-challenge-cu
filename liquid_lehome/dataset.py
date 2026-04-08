@@ -51,6 +51,8 @@ class LeHomeSequenceDataset(Dataset):
         rgb_keys: Sequence[str],
         low_dim_keys: Sequence[str],
         rgb_image_size: int = 96,
+        depth_keys: Sequence[str] = (),
+        depth_image_size: int = 96,
         state_normalize_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         action_normalize_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         episode_indices: Optional[List[int]] = None,
@@ -62,8 +64,10 @@ class LeHomeSequenceDataset(Dataset):
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.rgb_keys = list(rgb_keys)
+        self.depth_keys = list(depth_keys)
         self.low_dim_keys = list(low_dim_keys)
         self.rgb_image_size = rgb_image_size
+        self.depth_image_size = depth_image_size
         self.state_normalize_fn = state_normalize_fn
         self.action_normalize_fn = action_normalize_fn
         self.enable_image_augmentation = enable_image_augmentation
@@ -254,6 +258,16 @@ class LeHomeSequenceDataset(Dataset):
                 images.append(img_tensor)
             obs_dict[key] = torch.stack(images, dim=0)
 
+        # Depth images from parquet (stored as uint16 mm arrays)
+        for key in self.depth_keys:
+            if key not in rows.columns:
+                continue
+            depth_frames = []
+            for t in range(self.obs_horizon):
+                raw = rows[key].iloc[t]
+                depth_frames.append(self._to_depth_tensor(raw))
+            obs_dict[key] = torch.stack(depth_frames, dim=0)  # (T, 1, H', W')
+
         # Low-dim state
         for key in self.low_dim_keys:
             parts = []
@@ -329,6 +343,24 @@ class LeHomeSequenceDataset(Dataset):
             img = img[y : y + crop_h, x : x + crop_w]
 
         return img
+
+    def _to_depth_tensor(self, raw) -> torch.Tensor:
+        """Convert a raw depth value (uint16 mm or 2-D array) to (1, H', W') float [0,1]."""
+        arr = np.asarray(raw, dtype=np.float32)
+        if arr.ndim < 2:
+            raise ValueError(f"Expected 2D depth array, got shape {arr.shape}")
+        # Convert mm to meters, then normalize to [0, 1] assuming max 2m
+        if arr.max() > 100.0:
+            arr = arr / 1000.0
+        arr = np.clip(arr / 2.0, 0.0, 1.0)
+        t = torch.from_numpy(arr).unsqueeze(0)  # (1, H, W)
+        t = F.interpolate(
+            t.unsqueeze(0),
+            size=(self.depth_image_size, self.depth_image_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        return t
 
     @staticmethod
     def _to_float_tensor(val) -> torch.Tensor:

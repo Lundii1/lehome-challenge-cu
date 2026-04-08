@@ -184,13 +184,31 @@ def _denormalize_actions(
     return actions
 
 
-def _predict_chunk(artifacts: LoadedArtifacts, obs_dict: Dict[str, torch.Tensor]) -> np.ndarray:
+def _resolve_rollout_mode(
+    artifacts: LoadedArtifacts,
+    rollout_mode: Optional[str],
+    sample_k: Optional[int],
+) -> Tuple[str, int]:
+    if rollout_mode is None or rollout_mode == "checkpoint":
+        return artifacts.cfg.sample_selection_mode, artifacts.cfg.sample_selection_k
+    if rollout_mode == "deterministic":
+        return "mean", max(1, sample_k or artifacts.cfg.sample_selection_k)
+    return rollout_mode, max(1, sample_k or artifacts.cfg.sample_selection_k)
+
+
+def _predict_chunk(
+    artifacts: LoadedArtifacts,
+    obs_dict: Dict[str, torch.Tensor],
+    rollout_mode: Optional[str] = None,
+    sample_k: Optional[int] = None,
+) -> np.ndarray:
     batched_obs = {key: value.unsqueeze(0).to(artifacts.device) for key, value in obs_dict.items()}
+    effective_mode, effective_k = _resolve_rollout_mode(artifacts, rollout_mode, sample_k)
     with torch.inference_mode():
         pred = artifacts.model.rollout_actions(
             obs_dict=batched_obs,
-            mode=artifacts.cfg.sample_selection_mode,
-            sample_k=artifacts.cfg.sample_selection_k,
+            mode=effective_mode,
+            sample_k=effective_k,
         )[0].detach().cpu()
     pred = _denormalize_actions(pred, artifacts.cfg, artifacts.action_stats)
     return pred.numpy()
@@ -283,6 +301,8 @@ def _run_prediction_sensitivity_suite(
     seed: int,
     episode_indices: Optional[Sequence[int]] = None,
     title: str = "Prediction Sensitivity",
+    rollout_mode: Optional[str] = None,
+    sample_k: Optional[int] = None,
 ) -> PredictionSensitivitySummary:
     dataset = _build_dataset(
         artifacts.cfg,
@@ -303,11 +323,12 @@ def _run_prediction_sensitivity_suite(
         zero_rgb_deltas: List[float] = []
         rgb_swap_deltas: List[float] = []
         state_swap_deltas: List[float] = []
+        effective_mode, effective_k = _resolve_rollout_mode(artifacts, rollout_mode, sample_k)
 
         print(f"\n=== {title} ===")
         print(
             "windows="
-            f"{len(window_indices)} compare_steps={compare_steps} mode={artifacts.cfg.sample_selection_mode}"
+            f"{len(window_indices)} compare_steps={compare_steps} mode={effective_mode} sample_k={effective_k}"
         )
 
         for idx, base_idx in enumerate(window_indices):
@@ -315,10 +336,17 @@ def _run_prediction_sensitivity_suite(
             base_obs, base_actions = dataset[base_idx]
             donor_obs, _ = dataset[donor_idx]
 
-            base_pred = _predict_chunk(artifacts, base_obs)
+            base_pred = _predict_chunk(
+                artifacts,
+                base_obs,
+                rollout_mode=rollout_mode,
+                sample_k=sample_k,
+            )
             zero_rgb_pred = _predict_chunk(
                 artifacts,
                 _zero_rgb(base_obs, artifacts.cfg.rgb_keys),
+                rollout_mode=rollout_mode,
+                sample_k=sample_k,
             )
             donor_rgb_pred = _predict_chunk(
                 artifacts,
@@ -330,6 +358,8 @@ def _run_prediction_sensitivity_suite(
                     swap_rgb=True,
                     swap_state=False,
                 ),
+                rollout_mode=rollout_mode,
+                sample_k=sample_k,
             )
             donor_state_pred = _predict_chunk(
                 artifacts,
@@ -341,6 +371,8 @@ def _run_prediction_sensitivity_suite(
                     swap_rgb=False,
                     swap_state=True,
                 ),
+                rollout_mode=rollout_mode,
+                sample_k=sample_k,
             )
 
             target = _denormalize_actions(base_actions, artifacts.cfg, artifacts.action_stats).numpy()
@@ -592,6 +624,8 @@ def _run_train_smoke(args: argparse.Namespace) -> TrainSmokeSummary:
             seed=args.seed,
             episode_indices=selected_episodes,
             title="Post-Train-Smoke Sensitivity",
+            rollout_mode=args.rollout_mode,
+            sample_k=args.rollout_sample_k,
         )
         return summary
     finally:
@@ -609,6 +643,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_windows", type=int, default=8, help="Number of dataset windows for checkpoint diagnostics")
     parser.add_argument("--compare_steps", type=int, default=3, help="How many predicted steps to compare")
+    parser.add_argument(
+        "--rollout_mode",
+        type=str,
+        default="checkpoint",
+        choices=("checkpoint", "deterministic", "mean", "best_of_k", "sample", "stochastic"),
+        help=(
+            "Override the rollout mode used during diagnostics. "
+            "'checkpoint' uses the checkpoint/config default, "
+            "'deterministic' forces mean-mode for a stable comparison."
+        ),
+    )
+    parser.add_argument(
+        "--rollout_sample_k",
+        type=int,
+        default=None,
+        help="Optional sample count override for diagnostics when the rollout mode uses sampling.",
+    )
     parser.add_argument("--train_smoke_steps", type=int, default=0, help="Run a short training smoke for this many optimizer steps")
     parser.add_argument("--train_smoke_episodes", type=int, default=4, help="How many episodes to use for train smoke")
     parser.add_argument("--train_smoke_batch_size", type=int, default=None, help="Optional batch size override for train smoke")
@@ -639,6 +690,8 @@ def main() -> None:
             compare_steps=args.compare_steps,
             seed=args.seed,
             title="Checkpoint Sensitivity",
+            rollout_mode=args.rollout_mode,
+            sample_k=args.rollout_sample_k,
         )
 
     if args.train_smoke_steps > 0:

@@ -16,6 +16,31 @@ except ImportError:  # pragma: no cover - optional dependency
     CLIPVisionModel = None
 
 
+def _load_clip_vision_model(model_name: str):
+    """Load CLIP vision weights via safetensors.
+
+    Newer ``transformers`` releases reject ``torch.load`` on Torch < 2.6 due
+    to CVE-2025-32434. For CLIP backbones we can avoid that path entirely by
+    explicitly requesting safetensors.
+    """
+    if CLIPVisionModel is None:
+        raise ImportError(
+            "CLIP vision backbones require the transformers package to be installed."
+        )
+    try:
+        return CLIPVisionModel.from_pretrained(model_name, use_safetensors=True)
+    except Exception as exc:
+        message = str(exc)
+        if "torch.load" in message or "v2.6" in message or "safetensors" in message:
+            raise RuntimeError(
+                "Failed to load CLIP vision weights safely. This environment needs "
+                "the model's safetensors weights to be available, or Torch must be "
+                "upgraded to >= 2.6. If the model is not cached locally, rerun with "
+                "internet access so transformers can download the safetensors files."
+            ) from exc
+        raise
+
+
 @dataclass(frozen=True)
 class SharedBackboneConfig:
     rgb_keys: Sequence[str]
@@ -29,6 +54,8 @@ class SharedBackboneConfig:
     freeze_rgb_encoder: bool = False
     clip_model_name: str = "openai/clip-vit-base-patch32"
     rgb_image_size: int = 96
+    depth_keys: Sequence[str] = ()
+    depth_image_size: int = 96
 
 
 @dataclass(frozen=True)
@@ -42,7 +69,7 @@ class LiquidPolicyConfig:
     decoder_hidden_dim: int
     action_embed_dim: int
     use_cfc: bool = True
-    sample_selection_mode: str = "mean"
+    sample_selection_mode: str = "sample"
     sample_selection_k: int = 10
 
 
@@ -96,7 +123,7 @@ class ClipVisualEncoder(nn.Module):
             raise ImportError(
                 "rgb_encoder_kind='clip' requires the transformers package to be installed."
             )
-        self.encoder = CLIPVisionModel.from_pretrained(model_name)
+        self.encoder = _load_clip_vision_model(model_name)
         hidden_size = self.encoder.config.hidden_size
         self.proj = nn.Linear(hidden_size, model_dim)
         self.register_buffer(
@@ -130,6 +157,136 @@ class ClipVisualEncoder(nn.Module):
         return encoded
 
 
+class SpatialClipEncoder(nn.Module):
+    """CLIP encoder that preserves spatial information via patch token attention.
+
+    Instead of using CLIP's pooler_output (which collapses all spatial info into
+    a single vector), this encoder uses the full sequence of patch embeddings
+    (7x7=49 patches for ViT-B/32 at 224x224) and applies learned spatial
+    attention to produce a spatially-grounded feature vector.
+
+    This allows the model to know WHERE objects are in the image, not just WHAT
+    the image contains.
+    """
+
+    def __init__(self, model_name: str, model_dim: int, num_spatial_heads: int = 4):
+        super().__init__()
+        if CLIPVisionModel is None:
+            raise ImportError(
+                "rgb_encoder_kind='spatial_clip' requires the transformers package."
+            )
+        self.encoder = _load_clip_vision_model(model_name)
+        hidden_size = self.encoder.config.hidden_size  # 768 for ViT-B/32
+
+        # Learned spatial attention: query attends over patch tokens
+        self.spatial_query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.spatial_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_spatial_heads,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.spatial_norm = nn.LayerNorm(hidden_size)
+
+        # Project attended features to model_dim
+        self.proj = nn.Linear(hidden_size, model_dim)
+
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        squeeze_batch = False
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+            squeeze_batch = True
+        if images.ndim != 5:
+            raise ValueError(
+                f"Expected (B, T, C, H, W) or (T, C, H, W), got {tuple(images.shape)}"
+            )
+
+        batch, horizon, channels, height, width = images.shape
+        flat = images.reshape(batch * horizon, channels, height, width)
+        if height != 224 or width != 224:
+            flat = F.interpolate(flat, size=(224, 224), mode="bilinear", align_corners=False)
+        flat = (flat - self.pixel_mean.view(1, 3, 1, 1)) / self.pixel_std.view(1, 3, 1, 1)
+
+        # Get patch embeddings: last_hidden_state is (N, num_patches+1, hidden_size)
+        # where token 0 is the [CLS] token and tokens 1: are the 7x7=49 patch tokens
+        clip_out = self.encoder(pixel_values=flat, output_hidden_states=False)
+        patch_tokens = clip_out.last_hidden_state  # (N, 50, 768)
+
+        # Spatial attention: learned query attends to all patch tokens
+        query = self.spatial_query.expand(patch_tokens.shape[0], -1, -1)  # (N, 1, 768)
+        attended, _ = self.spatial_attn(query, patch_tokens, patch_tokens)  # (N, 1, 768)
+        attended = self.spatial_norm(attended.squeeze(1))  # (N, 768)
+
+        encoded = self.proj(attended).view(batch, horizon, -1)
+        if squeeze_batch:
+            encoded = encoded.squeeze(0)
+        return encoded
+
+
+class DepthEncoder(nn.Module):
+    """Lightweight CNN that encodes single-channel depth images.
+
+    Depth gives direct 3D geometric information about the cloth state —
+    how puffed open it is, whether the two sides are actually coming
+    together, and where the fabric is in the workspace. This is far more
+    informative for manipulation than RGB alone.
+
+    Input: (B, T, 1, H, W) depth images normalized to [0, 1].
+    Output: (B, T, model_dim) feature vectors.
+    """
+
+    def __init__(self, model_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        # Keep spatial structure: 96→48→24→12→6, use spatial pooling with
+        # learned weights instead of blind averaging
+        self.spatial_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),  # (256, 4, 4)
+            nn.Flatten(),             # (256*4*4 = 4096)
+            nn.Linear(256 * 4 * 4, model_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, depth: torch.Tensor) -> torch.Tensor:
+        squeeze_batch = False
+        if depth.ndim == 4:
+            depth = depth.unsqueeze(0)
+            squeeze_batch = True
+        if depth.ndim != 5:
+            raise ValueError(
+                f"Expected depth tensor of shape (B, T, 1, H, W) or (T, 1, H, W), "
+                f"got {tuple(depth.shape)}"
+            )
+
+        batch, horizon, channels, height, width = depth.shape
+        flat = depth.reshape(batch * horizon, channels, height, width)
+        features = self.net(flat)
+        encoded = self.spatial_pool(features).view(batch, horizon, -1)
+        if squeeze_batch:
+            encoded = encoded.squeeze(0)
+        return encoded
+
+
 class SharedObsBackbone(nn.Module):
     """Legacy shared backbone with equal-weight mean fusion."""
 
@@ -149,6 +306,8 @@ class SharedObsBackbone(nn.Module):
                 self.visual_encoder: Optional[nn.Module] = TinyVisualEncoder(config.model_dim)
             elif config.rgb_encoder_kind == "clip":
                 self.visual_encoder = ClipVisualEncoder(config.clip_model_name, config.model_dim)
+            elif config.rgb_encoder_kind == "spatial_clip":
+                self.visual_encoder = SpatialClipEncoder(config.clip_model_name, config.model_dim)
             else:
                 raise NotImplementedError(
                     f"Unsupported rgb_encoder_kind: {config.rgb_encoder_kind}"
@@ -158,6 +317,12 @@ class SharedObsBackbone(nn.Module):
                     parameter.requires_grad = False
         else:
             self.visual_encoder = None
+
+        self.depth_keys = tuple(key for key in config.depth_keys if key in obs_shapes)
+        if self.depth_keys:
+            self.depth_encoder: Optional[nn.Module] = DepthEncoder(config.model_dim)
+        else:
+            self.depth_encoder = None
 
         if self.low_dim_keys:
             first_shape = self.obs_shapes[self.low_dim_keys[0]]
@@ -200,6 +365,26 @@ class SharedObsBackbone(nn.Module):
             return None
         return torch.stack(components, dim=0).mean(dim=0)
 
+    def _encode_depth(self, obs_dict: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        if self.depth_encoder is None:
+            return None
+
+        components = []
+        for key in self.depth_keys:
+            if key not in obs_dict:
+                continue
+            depth = obs_dict[key]
+            if depth.ndim == 3:
+                # (B, T, H, W) -> add channel dim
+                depth = depth.unsqueeze(2)
+            if depth.ndim == 4:
+                depth = depth.unsqueeze(0)
+            components.append(self.depth_encoder(depth))
+
+        if not components:
+            return None
+        return torch.stack(components, dim=0).mean(dim=0)
+
     def _encode_low_dim(self, obs_dict: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:
         if self.low_dim_proj is None:
             return None
@@ -225,6 +410,9 @@ class SharedObsBackbone(nn.Module):
         rgb_features = self._encode_rgb(obs_dict)
         if rgb_features is not None:
             components.append(rgb_features)
+        depth_features = self._encode_depth(obs_dict)
+        if depth_features is not None:
+            components.append(depth_features)
         low_dim_features = self._encode_low_dim(obs_dict)
         if low_dim_features is not None:
             components.append(low_dim_features)

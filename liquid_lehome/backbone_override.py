@@ -34,7 +34,7 @@ class EnhancedObsBackbone(SharedObsBackbone):
         state_dropout_p: float = 0.0,
     ):
         super().__init__(obs_shapes, config)
-        n_modalities = int(bool(self.rgb_keys)) + int(bool(self.low_dim_keys))
+        n_modalities = int(bool(self.rgb_keys)) + int(bool(self.depth_keys)) + int(bool(self.low_dim_keys))
         if n_modalities > 1:
             self.fusion_proj = nn.Linear(config.model_dim * n_modalities, config.model_dim)
         else:
@@ -46,6 +46,10 @@ class EnhancedObsBackbone(SharedObsBackbone):
         rgb_features = self._encode_rgb(obs_dict)
         if rgb_features is not None:
             components.append(rgb_features)
+
+        depth_features = self._encode_depth(obs_dict)
+        if depth_features is not None:
+            components.append(depth_features)
 
         low_dim_features = self._encode_low_dim(obs_dict)
         if low_dim_features is not None:

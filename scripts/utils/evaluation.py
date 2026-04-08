@@ -714,6 +714,8 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             policy_kwargs["model_path"] = args.policy_path
         if args.dataset_root:
             policy_kwargs["dataset_root"] = args.dataset_root
+        if getattr(args, "rollout_mode", None) is not None:
+            policy_kwargs["rollout_mode"] = args.rollout_mode
 
     # Create policy from registry
     policy = PolicyRegistry.create(args.policy_type, **policy_kwargs)

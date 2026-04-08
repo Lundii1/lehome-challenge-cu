@@ -1,0 +1,18 @@
+{
+    "dataset_root": "Datasets/example/four_types_merged",
+    "num_epochs": 120,
+    "batch_size": 32,
+    "learning_rate": 1e-4,
+    "output_dir": "outputs/liquid_all_types",
+    "save_every_n_epochs": 10,
+    "log_every_n_steps": 50,
+    "num_data_workers": 4,
+    "device": "cuda",
+    "teacher_forcing_end": 0.40,
+
+    "rgb_encoder_kind": "spatial_clip",
+    "freeze_rgb_encoder": false,
+    "observation_horizon": 4,
+    "action_horizon": 4,
+    "rgb_image_size": 128
+}
